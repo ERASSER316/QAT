@@ -20,8 +20,9 @@ CUDA_VISIBLE_DEVICES=2 python qat_w8a8_fakequant_train.py \
     --save_dir ../../modelnew/llama3.2-1b-w8a8-qat-experiment \
     --train_batch_size 1 \
     --gradient_accumulation_steps 16 \
-    --max_steps 100 \
+    --max_steps 400 \
     --lr 2e-5 \
+    --weight_decay 0.1 \
     --seed 42 \
     --device cuda
 """
@@ -60,13 +61,20 @@ def parse_args():
                         help="Where to save the converted (de-fake) QAT model")
 
     parser.add_argument("--train_batch_size", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--max_steps", type=int, default=400)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.1,
+                        help="Weight decay for AdamW")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16,
                         help="Number of micro-batches to accumulate before each optimizer step")
 
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Optional: limit training samples for quick experiments")
+
+    parser.add_argument("--eval_interval", type=int, default=50,
+                        help="Run on-the-fly eval every N optimizer steps (<=0 to disable)")
+    parser.add_argument("--eval_max_samples", type=int, default=256,
+                        help="Limit eval samples to speed up periodic evaluation")
 
     parser.add_argument("--device", type=str, default="cuda",
                         help="cuda or cpu")
@@ -102,6 +110,46 @@ def collate_fn(examples):
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,  # 保留-100标记，避免对padding tokens计算loss
+    }
+
+
+def evaluate_model(model, dataloader, device, max_samples=None):
+    """
+    轻量评测：在训练中周期性调用，返回 PPL / avg_loss，快速察觉退化。
+    """
+    model.eval()
+    total_nll = 0.0
+    total_tokens = 0
+    samples_seen = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if max_samples is not None and samples_seen >= max_samples:
+                break
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            n_tokens = (batch["labels"] != -100).sum().item()
+            total_nll += loss.item() * n_tokens
+            total_tokens += n_tokens
+            samples_seen += batch["input_ids"].size(0)
+
+            if max_samples is not None and samples_seen >= max_samples:
+                break
+
+    model.train()
+
+    if total_tokens == 0:
+        return {"ppl": float("inf"), "avg_loss": float("nan"), "samples": samples_seen}
+
+    avg_loss = total_nll / total_tokens
+    return {
+        "ppl": float(torch.exp(torch.tensor(avg_loss)).item()),
+        "avg_loss": float(avg_loss),
+        "samples": int(samples_seen),
+        "tokens": int(total_tokens),
     }
 
 
@@ -267,7 +315,9 @@ def main():
     print("\n[Step 5] QAT training (W8A8 fake quant)...")
     model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
 
     total_update_steps = args.max_steps
     warmup_steps = int(total_update_steps * args.warmup_ratio)
@@ -290,6 +340,17 @@ def main():
 
     print(f"Starting training with gradient_accumulation_steps={gradient_accumulation_steps}")
     print(f"Target total update steps: {args.max_steps}")
+
+    # 构建轻量 eval dataloader（如果数据集中有 test/validation）
+    eval_loader = None
+    if isinstance(dataset, dict) and "test" in dataset:
+        eval_loader = DataLoader(
+            dataset["test"],
+            batch_size=args.train_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
+        print("  ✓ Found test split; will run periodic eval.")
 
     for epoch in range(10**9):
         for batch in train_loader:
@@ -334,6 +395,24 @@ def main():
                     print(
                         f"[step {global_step}] loss={current_loss_val:.4f}, "
                         f"ema_loss={ema_loss:.4f}, lr={current_lr:.6e}"
+                    )
+
+                if (
+                    eval_loader is not None
+                    and args.eval_interval > 0
+                    and global_step % args.eval_interval == 0
+                ):
+                    eval_stats = evaluate_model(
+                        model,
+                        eval_loader,
+                        device,
+                        max_samples=args.eval_max_samples,
+                    )
+                    print(
+                        f"    [eval every {args.eval_interval} steps] "
+                        f"ppl={eval_stats['ppl']:.3f}, "
+                        f"avg_loss={eval_stats['avg_loss']:.4f}, "
+                        f"samples={eval_stats['samples']}"
                     )
 
                 if global_step >= args.max_steps:
